@@ -8,8 +8,10 @@ import re
 import sqlite3
 import time
 
+import datasets
 import mwparserfromhell
 from dotenv import load_dotenv
+from huggingface_hub import HfApi
 from openai import OpenAI
 from tqdm import tqdm
 
@@ -150,11 +152,13 @@ def clean_wikitext(text):
 def is_redirect(text):
     return text.strip().lower().startswith('#redirect')
 
-def process_articles(db_path, article_ids, output_file, cache_dir):
+def process_articles(db_path, article_ids, cache_dir):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    with open(output_file, 'a', encoding='utf-8') as f, tqdm(total=len(article_ids), desc="Processing articles") as pbar:
+    dataset = datasets.Dataset.from_dict({"title": [], "context": [], "question": [], "answer": []})
+
+    with tqdm(total=len(article_ids), desc="Processing articles") as pbar:
         for article_id in article_ids:
             cursor.execute('SELECT title, content FROM articles WHERE id = ?', (article_id,))
             result = cursor.fetchone()
@@ -165,16 +169,16 @@ def process_articles(db_path, article_ids, output_file, cache_dir):
                     qa_pairs = generate_questions(article, cache_dir)
                     for qa in qa_pairs:
                         qa_entry = {
-                            "article_title": title,
-                            "article_content": article["content"],
-                            "spørgsmål": qa["spørgsmål"],
-                            "svar": qa["svar"]
+                            "title": title,
+                            "context": article["content"],
+                            "question": qa["spørgsmål"],
+                            "answer": qa["svar"]
                         }
-                        f.write(json.dumps(qa_entry, ensure_ascii=False) + "\n")
+                        dataset = dataset.add_item(qa_entry)
                 pbar.update(1)
-                f.flush()
 
     conn.close()
+    return dataset
 
 def main(args):
     db_path = "danish_wikipedia.db"
@@ -195,23 +199,34 @@ def main(args):
 
     conn.close()
 
-    output_file = "danish_wikipedia_qa_dataset.jsonl"
-    if not args.resume:
-        open(output_file, 'w').close()
-
     try:
-        process_articles(db_path, selected_article_ids, output_file, cache_dir)
+        dataset = process_articles(db_path, selected_article_ids, cache_dir)
+
+        dataset.save_to_disk("daqa")
+
+        if args.upload:
+            api = HfApi()
+            repo_id = args.repo_id
+            repo = api.create_repo(repo_id, private=True, repo_type="dataset", exist_ok=False)
+            dataset.push_to_hub(repo_id)
+            logging.info(f"Dataset uploaded to Hugging Face Hub: {repo_id}")
+        else:
+            logging.info(f"Q&A dataset saved to {dataset}")
     except Exception as e:
         logging.error(f"Error in main processing loop: {e}")
 
-    logging.info(f"Q&A dataset saved to {output_file}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate Q&A dataset from Danish Wikipedia")
     parser.add_argument("--limit", type=int, help="Limit the number of articles to process")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for shuffling articles")
-    parser.add_argument("--resume", action="store_true", help="Resume from last processed article")
+    parser.add_argument("--upload", action="store_true", help="Upload the dataset to Hugging Face Hub")
+    parser.add_argument("--repo-id", type=str, help="Hugging Face Hub repository ID for uploading")
     args = parser.parse_args()
+
+    if args.upload and not args.repo_id:
+        parser.error("--repo-id is required when --upload is set")
+
     try:
         main(args)
     except Exception as e:
