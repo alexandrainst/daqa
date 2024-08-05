@@ -45,8 +45,8 @@ def process_article(title, text):
     return {"title": title, "content": content}
 
 def is_meaningful_article(content):
-    min_content_length = 300
-    min_word_count = 50
+    min_content_length = 500
+    min_word_count = 70
     
     word_count = len(content.split())
     
@@ -88,7 +88,7 @@ def is_include_only(content):
     return False
 
 
-def generate_questions(article, cache_dir):
+def generate_questions(article, cache_dir, hard: bool):
     logging.debug(f"Generating questions for article: {article['title']}")
     article_hash = hashlib.md5((article['title'] + article['content']).encode()).hexdigest()
     cache_file = os.path.join(cache_dir, f"{article_hash}.json")
@@ -98,17 +98,34 @@ def generate_questions(article, cache_dir):
             logging.debug(f"Loading cached questions for article: {article['title']}")
             return json.loads(f.read())
 
-    prompt = f"""
-    Givet følgende Wikipedia-artikel, skal du generere 5 spørgsmål og deres svar baseret på indholdet. 
-    Svaret skal stå direkte i den givne artikel, uden brug af anden viden. Svaret skal være kort, gerne kun 1 til 2 ord eller et tal.
-    Spørgsmålet må gerne være svært, og omformuler gerne ord i teksten.
-    Formater outputtet som en liste af `dict`s, hvor hver `dict` indeholder en 'spørgsmål' og en 'svar' nøgle.
+    if hard:
+        logging.info(f"Generating hard questions for article: {article['title']}")
+        prompt = f"""
+        Givet følgende Wikipedia-artikel, skal du generere 3 spørgsmål og deres svar baseret på indholdet. 
+        Svaret skal kunne udledes fra information i artiklen, ved brug af almindelig viden og logik. Svaret skal være et par ord eller højest en kort sætning.
+        Spørgsmålene skal være udfordrende, svarene må ikke stå direkte i artiklen. Der skal gerne bruges 2-3 logiske trin til at udlede svaret.
+        Det kunne for eksempel være at man skal kombinere to forskellige informationer, eller at man skal kombinere en information med sund fornuft.
+        Overvej derfor grundigt hvilke spørgsmål som er udfordrende nok. Det er ikke nok bare at spørge direkte om fakta.
+        Formater outputtet som en JSON liste af `dict`s, hvor hver `dict` indeholder en 'spørgsmål' og en 'svar' nøgle.
 
-    Titel: {article['title']}
-    Indhold: {article['content'][:6000]}
+        Titel: {article['title']}
+        Indhold: {article['content'][:8000]}
 
-    Output kun listen af `dict`s, uden yderligere tekst. Sørg for at både spørgsmål og svar er på dansk.
-    """
+        Tænk først over hvilke spørgsmål som kunne være udfordrende og interessante nok. Skriv din begrundelse kort, en sætning per spørgsmål. Skriv derefter JSON listen af `dict`s. Der skal være 3 spørgsmål. Sørg for at alle genererede spørgsmål og svar er på dansk.
+        """
+    else:
+        logging.info(f"Generating soft questions for article: {article['title']}")
+        prompt = f"""
+        Givet følgende Wikipedia-artikel, skal du generere 5 spørgsmål og deres svar baseret på indholdet. 
+        Svaret skal stå direkte i den givne artikel, uden brug af anden viden. Svaret skal være kort, gerne kun 1 til 2 ord eller et tal.
+        Spørgsmålet må gerne være svært, og omformuler gerne ord i teksten.
+        Formater outputtet som en liste af `dict`s, hvor hver `dict` indeholder en 'spørgsmål' og en 'svar' nøgle.
+
+        Titel: {article['title']}
+        Indhold: {article['content'][:8000]}
+
+        Output kun listen af `dict`s, uden yderligere tekst. Sørg for at både spørgsmål og svar er på dansk.
+        """
 
     max_retries = 3
     for attempt in range(max_retries):
@@ -125,7 +142,12 @@ def generate_questions(article, cache_dir):
             if response.choices[0].message.content is None:
                 raise ValueError("Empty response from API")
 
-            qa_pairs = json.loads(response.choices[0].message.content)
+            logging.info(f"Response from API: {response.choices[0].message.content}")
+            json_matches = re.findall(r'\[.*?\]', response.choices[0].message.content, re.DOTALL)
+            logging.info(json_matches)
+            qa_pairs = json.loads(json_matches[0])
+            assert type(qa_pairs) == list
+            logging.info(qa_pairs)
 
             with open(cache_file, 'w', encoding='utf-8') as f:
                 f.write(json.dumps(qa_pairs, ensure_ascii=False, indent=2))
@@ -152,7 +174,7 @@ def clean_wikitext(text):
 def is_redirect(text):
     return text.strip().lower().startswith('#redirect')
 
-def process_articles(db_path, article_ids, cache_dir):
+def process_articles(db_path, article_ids, cache_dir, hard: bool):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
@@ -166,7 +188,7 @@ def process_articles(db_path, article_ids, cache_dir):
                 title, text = result
                 article = process_article(title, text)
                 if article:
-                    qa_pairs = generate_questions(article, cache_dir)
+                    qa_pairs = generate_questions(article, cache_dir, hard)
                     for qa in qa_pairs:
                         qa_entry = {
                             "title": title,
@@ -182,7 +204,7 @@ def process_articles(db_path, article_ids, cache_dir):
 
 def main(args):
     db_path = "danish_wikipedia.db"
-    cache_dir = "qa_cache"
+    cache_dir = "qa_cache_hard" if args.hard else "qa_cache"
     os.makedirs(cache_dir, exist_ok=True)
 
     conn = sqlite3.connect(db_path)
@@ -199,21 +221,18 @@ def main(args):
 
     conn.close()
 
-    try:
-        dataset = process_articles(db_path, selected_article_ids, cache_dir)
+    dataset = process_articles(db_path, selected_article_ids, cache_dir, args.hard)
 
-        dataset.save_to_disk("daqa")
+    dataset.save_to_disk("daqa-hard" if args.hard else "daqa")
 
-        if args.upload:
-            api = HfApi()
-            repo_id = args.repo_id
-            repo = api.create_repo(repo_id, private=True, repo_type="dataset", exist_ok=False)
-            dataset.push_to_hub(repo_id)
-            logging.info(f"Dataset uploaded to Hugging Face Hub: {repo_id}")
-        else:
-            logging.info(f"Q&A dataset saved to {dataset}")
-    except Exception as e:
-        logging.error(f"Error in main processing loop: {e}")
+    if args.upload:
+        api = HfApi()
+        repo_id = args.repo_id
+        repo = api.create_repo(repo_id, private=True, repo_type="dataset", exist_ok=False)
+        dataset.push_to_hub(repo_id)
+        logging.info(f"Dataset uploaded to Hugging Face Hub: {repo_id}")
+    else:
+        logging.info(f"Q&A dataset saved to {dataset}")
 
 
 if __name__ == "__main__":
@@ -222,6 +241,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed for shuffling articles")
     parser.add_argument("--upload", action="store_true", help="Upload the dataset to Hugging Face Hub")
     parser.add_argument("--repo-id", type=str, help="Hugging Face Hub repository ID for uploading")
+    parser.add_argument("--hard", action="store_true", help="Use hard prompt for generating questions")
     args = parser.parse_args()
 
     if args.upload and not args.repo_id:
